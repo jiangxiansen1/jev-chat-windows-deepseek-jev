@@ -49,6 +49,12 @@ class AdvisorPanel(CardWidget):
         head.addWidget(self._toggle)
         layout.addLayout(head)
 
+        # 会话归属常驻显示：结果可能在你切到别的会话之后才回来，
+        # 没有这一行就没法判断「这条建议是给谁的」
+        self._chat_label = BodyLabel("")
+        self._chat_label.setWordWrap(True)
+        layout.addWidget(self._chat_label)
+
         self._status = BodyLabel(_IDLE_HINT)
         self._status.setWordWrap(True)
         layout.addWidget(self._status)
@@ -83,6 +89,8 @@ class AdvisorPanel(CardWidget):
     def set_result(self, result: dict) -> None:
         """渲染一次 ask_advisor 的返回。失败时**清掉上一次的候选**。"""
         data = result if isinstance(result, dict) else {}
+        name = str(data.get("session_name") or "")
+        self._chat_label.setText(f"会话：{name}" if name else "")
         if not data.get("ok"):
             # 清空旧候选：留着的话用户可能点到已经过期的建议
             self._candidates = []
@@ -102,9 +110,18 @@ class AdvisorPanel(CardWidget):
         self._body.setVisible(self._expanded)
         self._toggle.setText("收起" if self._expanded else "展开")
 
+    def clear(self) -> None:
+        """清空面板。微信或界面切到别的会话时调用 —— 留着旧分析会被误用。"""
+        self._candidates = []
+        self._analysis.setText("")
+        self._chat_label.setText("")
+        self._rebuild()
+        self._status.setText(_IDLE_HINT)
+        self.set_expanded(False)
+
     def text(self) -> str:
-        """当前可见文案（状态 + 分析）。给测试用，也方便排查。"""
-        parts = [self._status.text(), self._analysis.text()]
+        """当前可见文案（会话归属 + 状态 + 分析）。给测试用，也方便排查。"""
+        parts = [self._chat_label.text(), self._status.text(), self._analysis.text()]
         return "\n".join(p for p in parts if p)
 
     def fill_button_count(self) -> int:

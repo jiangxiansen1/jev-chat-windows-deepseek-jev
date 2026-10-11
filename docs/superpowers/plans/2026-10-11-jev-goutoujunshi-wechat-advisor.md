@@ -12,6 +12,10 @@
 
 ## Global Constraints
 
+> ⚠️ 实施期修正：本清单里的「改 `app/worker.py`」已被证伪（worker 是 OCR 子进程、
+> 不持有会话历史），慢车道后台任务实际落在 `main.py`。其余修正见
+> [IMPLEMENTATION-NOTES-2026-10-11.md](../IMPLEMENTATION-NOTES-2026-10-11.md)。
+
 - Python **3.11**，装在 `D:\本地AI\Python311\`，安装时勾选 Add to PATH。
 - 微信 **4.1.13.12**（`D:\Weixin`），桌面版；**窗口必须可见、不得最小化**，否则不渲染、抓不到。
 - 改动**只允许**落在：`prompts/system_general.md`、`core/advisor.py`、`app/advisor_panel.py`、`tests/test_advisor.py`、`tests/test_draft_prompt.py`、`tests/test_advisor_panel.py`、`core/draft.py`、`app/overlay.py`、`app/worker.py`、`app/settings.py`、`README.md`、`NOTICE.md`。

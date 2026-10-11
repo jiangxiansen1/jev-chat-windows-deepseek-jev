@@ -449,6 +449,7 @@ class Overlay:
         # 慢车道入口：手动触发，不参与快车道的自动流程。
         # 它慢、贵，而且**永远不会挡住快车道** —— 失败只反映在侧栏里。
         self.advisorButton = PushButton("请教军师")
+        self.advisorButton.setVisible(settings.advisor_enabled())  # 关掉就不露出来
         self.advisorButton.setAccessibleName("请教狗头军师")
         self.advisorButton.setToolTip("把当前这段对话交给本地狗头军师深入分析；"
                                       "约十几秒，消耗比快车道多，失败也不影响上面的候选")
@@ -1024,6 +1025,11 @@ class Overlay:
         """换正在看的会话：记录、对方最近说、条数、上次的建议一起换过去。"""
         if title != self._shown:
             self.cancel_auto_send("已切换会话，自动发送已取消。")
+            # 慢车道的分析也跟着清：它是为上一个会话问的，
+            # 留着会挂在新会话界面上，被当成这个会话的建议
+            panel = getattr(self, "advisorPanel", None)
+            if panel is not None:
+                panel.clear()
         self._shown = title
         self.feed.clear()
         for line in self.feeds.get(title, []):

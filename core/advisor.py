@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -206,7 +207,32 @@ def filter_candidates(cands: list[str], their_recent: list[str]) -> list[str]:
 ADVISOR_CWD = r"D:\本地AI\jev-advisor-data\workspace"
 ADVISOR_TIMEOUT = 60.0
 _STATE_FILE = Path(r"D:\本地AI\jev-advisor-data\advisor_session.json")
+_LOG_FILE = Path(r"D:\本地AI\jev-advisor-data\logs\advisor.log")
 _BUSY = threading.Lock()
+
+# dsh 对未知 --session-id 会在任务运行前失败。**只有这种失败**才值得清记录重试；
+# 网络错误也去重试只会白烧一倍 token。
+_STALE_SESSION_PAT = re.compile(
+    r"unknown\s+session|session[^\n]{0,24}(?:not\s+found|invalid|不存在|未知)",
+    re.I)
+
+
+def _log(line: str) -> None:
+    """best-effort 诊断日志（spec §10）。
+
+    **绝不写聊天内容**：日志是排查用的，不是第二条泄漏渠道。
+    """
+    try:
+        _LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with _LOG_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {line}\n")
+    except Exception:
+        pass
+
+
+def _looks_like_stale_session(error: str) -> bool:
+    """这次失败是不是「本地记的会话 id 已失效」。看 stderr 形状，不看有没有报错。"""
+    return bool(_STALE_SESSION_PAT.search(error or ""))
 
 
 def _resolve_dsh() -> str | None:
@@ -264,22 +290,57 @@ def _run_headless(task: str, session_id: str | None, timeout: float) -> tuple[di
     if session_id:
         argv += ["--session-id", session_id]
     argv.append("-")
-    try:
-        proc = subprocess.run(
-            argv,
-            input=task.encode("utf-8"),
-            capture_output=True,
-            timeout=timeout,
-            cwd=ADVISOR_CWD,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    except FileNotFoundError:
-        return {}, "dsh-not-found"
-    events = parse_events(proc.stdout.decode("utf-8", "replace"))
-    if proc.returncode != 0:
-        lines = proc.stderr.decode("utf-8", "replace").strip().splitlines()
-        return events, (lines[-1][:200] if lines else f"dsh 退出码 {proc.returncode}")
+    code, out, err = _run_with_tree_kill(argv, task.encode("utf-8"), timeout, ADVISOR_CWD)
+    events = parse_events(out.decode("utf-8", "replace"))
+    if code != 0:
+        lines = err.decode("utf-8", "replace").strip().splitlines()
+        return events, (lines[-1][:200] if lines else f"dsh 退出码 {code}")
     return events, None
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """连**整棵进程树**一起杀。
+
+    Windows 上只 kill 直接子进程会留下孤儿（cmd.exe 的孙子进程），而孤儿继承了
+    stdout/stderr 的管道句柄，CPython 的 communicate() 会一直等它退出 ——
+    那样 timeout 就只是「等子进程自己走完」，不构成上限。
+    """
+    try:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                       capture_output=True, timeout=15,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
+def _run_with_tree_kill(argv: list[str], input_bytes: bytes, timeout: float,
+                        cwd: str) -> tuple[int, bytes, bytes]:
+    """跑一个子进程；超时就把整棵树杀掉，保证 timeout 到点就返回。
+
+    返回 (returncode, stdout, stderr)；超时抛 subprocess.TimeoutExpired。
+    用 Popen 而不是 subprocess.run(..., timeout=)：后者在 Windows 上
+    只 kill 直接子进程，孤儿会让它继续阻塞。
+    """
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    proc = subprocess.Popen(
+        argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        cwd=cwd, creationflags=flags,
+    )
+    try:
+        out, err = proc.communicate(input_bytes, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc)
+        try:
+            proc.communicate(timeout=15)  # 收尸；树已杀，这里应立即返回
+        except Exception:
+            pass
+        raise
+    return proc.returncode, out, err
 
 
 def ask_advisor(transcript: str, session_name: str, relationship: str,
@@ -297,13 +358,16 @@ def ask_advisor(transcript: str, session_name: str, relationship: str,
 
     def result(ok: bool, error: str | None, analysis: str = "",
                cands: list[str] | None = None, session_id: str | None = None) -> dict:
+        # session_name 必须回给 UI：结果可能在用户切到别的会话之后才到，
+        # 面板上没这一行，用户就会把 A 的分析当成 B 的建议
         return {"ok": ok, "analysis": analysis, "candidates": cands or [],
                 "elapsed": time.perf_counter() - started, "error": error,
-                "session_id": session_id or ""}
+                "session_id": session_id or "", "session_name": session_name}
 
     if not (transcript or "").strip():
         return result(False, "no-context")
     if _resolve_dsh() is None:
+        _log(f"dsh-missing session={session_name!r}")
         return result(False, "dsh-missing")
     if not _BUSY.acquire(blocking=False):
         return result(False, "busy")
@@ -313,27 +377,35 @@ def ask_advisor(transcript: str, session_name: str, relationship: str,
         try:
             events, error = _run_headless(task, session_id, timeout)
         except (subprocess.TimeoutExpired, TimeoutError):
+            _log(f"timeout {timeout}s session={session_name!r}")
             return result(False, "timeout")
         except Exception as exc:
+            _log(f"run-failed {type(exc).__name__}: {exc}")
             return result(False, str(exc)[:200] or "run-failed")
-        if error and session_id:
-            # 本地记的 id 失效了（sessions 被清过）：清掉并自动重试一次不带 id，
-            # 而不是把这个错误丢给用户
+        if error and session_id and _looks_like_stale_session(error):
+            # 本地记的 id 失效了（sessions 被清过）：清掉并自动重试一次不带 id。
+            # 只在**确实是会话失效**时重试 —— 网络错误重试只会白烧一倍 token。
+            _log(f"stale session {session_id!r} → 清记录后重试一次")
             _clear_session_id()
             session_id = None
             try:
                 events, error = _run_headless(task, None, timeout)
             except (subprocess.TimeoutExpired, TimeoutError):
+                _log(f"timeout(retry) {timeout}s session={session_name!r}")
                 return result(False, "timeout")
             except Exception as exc:
+                _log(f"run-failed(retry) {type(exc).__name__}: {exc}")
                 return result(False, str(exc)[:200] or "run-failed")
         fresh = events.get("session_id")
         if isinstance(fresh, str) and fresh:
             _save_session_id(fresh)
         if error:
+            _log(f"headless failed session={session_name!r} "
+                 f"turn_end={events.get('turn_end')!r}: {error}")
             return result(False, error, session_id=fresh or session_id)
         final = events.get("final")
         if not final:
+            _log(f"no-final session={session_name!r} turn_end={events.get('turn_end')!r}")
             return result(False, "no-final", session_id=fresh or session_id)
         analysis, cands = split_answer(final)
         return result(True, None, analysis,

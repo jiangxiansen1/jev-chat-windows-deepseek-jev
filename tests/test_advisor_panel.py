@@ -93,6 +93,29 @@ class AdvisorPanelTests(unittest.TestCase):
         panel.set_result({"ok": False, "error": "timeout"})
         self.assertEqual(panel.fill_button_count(), 0)
 
+    def test_shows_which_session_the_analysis_belongs_to(self):
+        # Review Focus #1 的用户可见面：结果异步到达，用户可能已经切到别的会话，
+        # 面板上若没有会话名，就会把 A 的分析当成 B 的建议来用
+        panel = self._panel()
+        panel.set_result({"ok": True, "analysis": "她的意图是试探",
+                          "candidates": [], "session_name": "小美"})
+        self.assertIn("小美", panel.text())
+
+    def test_clear_resets_panel_to_idle(self):
+        # 微信切到别的会话时，旧分析必须清掉，否则会挂在新会话界面上
+        panel = self._panel()
+        panel.set_result({"ok": True, "analysis": "A", "candidates": ["甲"],
+                          "session_name": "小美"})
+        panel.clear()
+        self.assertEqual(panel.fill_button_count(), 0)
+        self.assertIn("请教军师", panel.text())
+        self.assertNotIn("小美", panel.text())
+
+    def test_result_without_session_name_still_renders(self):
+        panel = self._panel()
+        panel.set_result({"ok": True, "analysis": "A", "candidates": []})
+        self.assertIn("A", panel.text())
+
 
 if __name__ == "__main__":
     unittest.main()

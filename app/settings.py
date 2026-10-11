@@ -20,6 +20,9 @@ else:
 _CONFIG = os.path.join(_ROOT, "config.json")
 _DEFAULT_RELATIONSHIP = "romantic partners"
 _DEFAULT_CONTEXT = 10
+_DEFAULT_ADVISOR_TIMEOUT = 60
+_ADVISOR_TIMEOUT_MIN = 10
+_ADVISOR_TIMEOUT_MAX = 300
 _ENV = "DEEPSEEK_API_KEY"
 _DEEPSEEK_ENV = _ENV  # 兼容旧调用名；定制版只使用 DeepSeek 官方服务
 _TYPESAFE_ENV = "TYPESAFE_API_KEY"
@@ -103,6 +106,25 @@ def check_update() -> bool:
     except (OSError, ValueError):
         return True
 
+def advisor_enabled() -> bool:
+    """慢车道（狗头军师）总开关。它慢且贵，用户应当能关掉。"""
+    try:
+        with open(_CONFIG, encoding="utf-8") as f:
+            return json.load(f).get("advisor_enabled", True) is not False
+    except (OSError, ValueError):
+        return True
+
+
+def advisor_timeout() -> int:
+    """慢车道单次调用的墙钟上限（秒）。夹在 10~300，缺失/脏数据退默认。"""
+    try:
+        with open(_CONFIG, encoding="utf-8") as f:
+            n = int(json.load(f).get("advisor_timeout", _DEFAULT_ADVISOR_TIMEOUT))
+    except (OSError, ValueError, TypeError):
+        return _DEFAULT_ADVISOR_TIMEOUT
+    return max(_ADVISOR_TIMEOUT_MIN, min(_ADVISOR_TIMEOUT_MAX, n))
+
+
 def _get_key(env_name: str) -> str:
     """进程环境优先；没有就读注册表并带进进程环境，之后 core/ 里按 os.environ 读就有了。"""
     v = os.environ.get(env_name, "").strip()
@@ -170,7 +192,9 @@ def save(key_text: str | None, relationship_text: str, context_n: int | None = N
          reply_target_on: bool | None = None, style_text: str | None = None,
          thinking_on: bool | None = None, check_update_on: bool | None = None,
          auto_send_on: bool | None = None, typesafe_key_text: str | None = None,
-         judge_provider_text: str | None = None) -> None:
+         judge_provider_text: str | None = None,
+         advisor_enabled_on: bool | None = None,
+         advisor_timeout_n: int | None = None) -> None:
     """每个参数为空/None = 保留当前值。key 只写进程环境 + HKCU\\Environment，不写文件。"""
     if key_text:
         _set_key(_ENV, key_text)
@@ -187,11 +211,17 @@ def save(key_text: str | None, relationship_text: str, context_n: int | None = N
     think = thinking() if thinking_on is None else bool(thinking_on)
     check = check_update() if check_update_on is None else bool(check_update_on)
     auto = False if sys.platform == "darwin" else (auto_send() if auto_send_on is None else bool(auto_send_on))
+    advisor_on = advisor_enabled() if advisor_enabled_on is None else bool(advisor_enabled_on)
+    advisor_to = (advisor_timeout() if advisor_timeout_n is None
+                  else max(_ADVISOR_TIMEOUT_MIN,
+                           min(_ADVISOR_TIMEOUT_MAX, int(advisor_timeout_n))))
     with open(_CONFIG, "w", encoding="utf-8") as f:
         json.dump({"relationship": relationship_text, "context": n, "draft_provider": provider,
                    "judge_provider": judge,
                    "reply_target": target, "style": style_v, "thinking": think,
-                   "check_update": check, "auto_send": auto}, f, ensure_ascii=False)
+                   "check_update": check, "auto_send": auto,
+                   "advisor_enabled": advisor_on, "advisor_timeout": advisor_to},
+                  f, ensure_ascii=False)
 
 def set_auto_send(enabled: bool) -> None:
     """主界面快捷开关：只更新自动发送，其他设置按当前值保留。"""

@@ -3,6 +3,10 @@
 冒出新的对方消息才调 engine → 悬浮窗给 3 条候选。默认手动发送；用户可显式开启 3 秒倒计时自动发送。静默期零调用。
 上下文、结果、聊天记录都按会话名（子进程 OCR 头部标题得来）分开存，切会话不串味。
 
+另外有一条**手动触发**的慢车道（狗头军师）：advisor_context / advisor_bg 把当前会话交给
+`dsh --profile headless` 跑，结果经 advisor_result 队列回给侧栏。它慢、贵，
+失败只写侧栏，绝不碰上面那 3 条候选。
+
     pip install rapidocr-onnxruntime numpy windows-capture PySide6-Fluent-Widgets
 DeepSeek 官方 key 在独立设置页填写，不用改代码。IDE 里直接 Run。
 """
@@ -146,7 +150,8 @@ def advisor_bg(transcript, their_recent, title):
     「它自己抛异常」这种谁也没预料到的情况也不会把线程打死。
     """
     try:
-        r = ask_advisor(transcript, title, settings.relationship(), their_recent)
+        r = ask_advisor(transcript, title, settings.relationship(), their_recent,
+                        timeout=settings.advisor_timeout())
     except Exception as e:
         r = {"ok": False, "analysis": "", "candidates": [], "elapsed": 0.0,
              "error": str(e)[:200] or "run-failed", "session_id": ""}

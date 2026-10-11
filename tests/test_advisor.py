@@ -7,6 +7,7 @@
   {"type":"final","text":"…"}
 对外暴露 snake_case 键（final / turn_end / session_id），驼峰只在解析层出现。
 """
+import subprocess
 import tempfile
 import threading
 import time
@@ -14,6 +15,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from app import settings
 from core import advisor
 
 
@@ -304,6 +306,166 @@ class AskAdvisorTests(unittest.TestCase):
             got = advisor.ask_advisor("她: 在忙", "小美", "暧昧", [])
         self.assertTrue(got["ok"])
         self.assertEqual(self.stored.get("sid"), "session-fresh")
+
+
+class WallClockTimeoutTests(unittest.TestCase):
+    """Review Focus #4 的真身：超时必须真的是**墙钟上限**。
+
+    Windows 上 cmd 启动的子进程会继承 stdout/stderr 管道句柄：只 kill 直接子进程（cmd）
+    会留下孤儿，CPython 的 communicate() 会一直等它退出。
+    代码评审实测：timeout=2 时实际阻塞 19.3 秒（约 9.6 倍）——
+    也就是说原来的 timeout 参数根本不构成上限，dsh 挂死时按钮会永久点不动。
+    """
+
+    def test_tree_kill_enforces_wall_clock_timeout(self):
+        started = time.perf_counter()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            advisor._run_with_tree_kill(
+                ["cmd", "/c", "ping", "-n", "20", "127.0.0.1"], b"", 2.0, str(Path.cwd()))
+        elapsed = time.perf_counter() - started
+        self.assertLess(elapsed, 8.0,
+                        f"超时没有真正生效：timeout=2 实际阻塞了 {elapsed:.1f}s")
+
+    def test_tree_kill_returns_output_for_quick_command(self):
+        code, out, _err = advisor._run_with_tree_kill(
+            ["cmd", "/c", "echo", "hi"], b"", 10.0, str(Path.cwd()))
+        self.assertEqual(code, 0)
+        self.assertIn(b"hi", out)
+
+    def test_tree_kill_passes_stdin_through(self):
+        # 任务文本走 stdin 是慢车道的核心设计（中文+引号拼命令行必然出事）
+        payload = "微信中文内容".encode("utf-8")
+        code, out, _err = advisor._run_with_tree_kill(
+            ["cmd", "/c", "more"], payload, 10.0, str(Path.cwd()))
+        self.assertEqual(code, 0)
+        self.assertIn(payload, out)
+
+
+class SessionLabelContractTests(unittest.TestCase):
+    """Review Focus #1 的另一半：结果必须带着会话名回到 UI。
+
+    只把会话名写进「发给 agent 的任务文本」是不够的 —— 那是给模型看的；
+    用户切到别的会话后，面板上若没有会话名，就会把 A 的分析当成 B 的建议用。
+    """
+
+    def setUp(self):
+        self.stored = {}
+        self._start_patch("_resolve_dsh", return_value=r"C:\fake\dsh.cmd")
+        self._start_patch("_load_session_id", side_effect=lambda: self.stored.get("sid"))
+        self._start_patch("_save_session_id",
+                          side_effect=lambda s: self.stored.__setitem__("sid", s))
+
+    def _start_patch(self, name, **kwargs):
+        p = patch.object(advisor, name, **kwargs)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_ok_result_carries_session_name(self):
+        with patch.object(advisor, "_run_headless",
+                          return_value=({"final": '分析\n\n["A"]'}, None)):
+            got = advisor.ask_advisor("她: 在忙", "小美", "暧昧", [])
+        self.assertEqual(got["session_name"], "小美")
+
+    def test_failure_result_also_carries_session_name(self):
+        with patch.object(advisor, "_run_headless",
+                          return_value=({"final": None, "turn_end": "error"}, "boom")):
+            got = advisor.ask_advisor("她: 在忙", "群-项目组", "同事", [])
+        self.assertEqual(got["session_name"], "群-项目组")
+
+
+class AdvisorSettingsTests(unittest.TestCase):
+    """spec §5 要求的 advisor 配置：至少要有一个关掉这条贵通道的开关。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = Path(self.tmp.name) / "config.json"
+        p = patch.object(settings, "_CONFIG", str(self.cfg))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_advisor_is_enabled_by_default(self):
+        self.assertTrue(settings.advisor_enabled())
+
+    def test_advisor_can_be_disabled_in_config(self):
+        self.cfg.write_text('{"advisor_enabled": false}', encoding="utf-8")
+        self.assertFalse(settings.advisor_enabled())
+
+    def test_advisor_timeout_defaults_and_clamps(self):
+        self.assertEqual(settings.advisor_timeout(), 60)
+        self.cfg.write_text('{"advisor_timeout": 5}', encoding="utf-8")
+        self.assertEqual(settings.advisor_timeout(), 10, "过小的超时要被夹到下限")
+        self.cfg.write_text('{"advisor_timeout": 9999}', encoding="utf-8")
+        self.assertEqual(settings.advisor_timeout(), 300, "过大的超时要被夹到上限")
+
+
+class FailureDiagnosticsTests(unittest.TestCase):
+    """spec §10：失败要保留诊断信息到日志；且不该把任何失败都当成会话失效去重试。"""
+
+    def setUp(self):
+        self.stored = {}
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.log = Path(self.tmp.name) / "advisor.log"
+        self._start_patch("_resolve_dsh", return_value=r"C:\fake\dsh.cmd")
+        self._start_patch("_load_session_id", side_effect=lambda: self.stored.get("sid"))
+        self._start_patch("_save_session_id",
+                          side_effect=lambda s: self.stored.__setitem__("sid", s))
+        self._start_patch("_clear_session_id", side_effect=lambda: self.stored.pop("sid", None))
+        self._start_patch("_LOG_FILE", new=self.log)
+
+    def _start_patch(self, name, **kwargs):
+        p = patch.object(advisor, name, **kwargs)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_network_error_is_not_treated_as_stale_session(self):
+        # 把任何失败都当成会话失效去重试，最坏单次点击 ≈2×timeout + 双倍 token
+        self.stored["sid"] = "session-old"
+        calls = []
+
+        def spy(_task, session_id, _timeout):
+            calls.append(session_id)
+            return ({"final": None, "turn_end": "error"}, "起草请求失败：连接被重置")
+
+        with patch.object(advisor, "_run_headless", side_effect=spy):
+            got = advisor.ask_advisor("她: 在忙", "小美", "暧昧", [])
+        self.assertEqual(len(calls), 1, "网络错误被误判成会话失效，白烧了一倍 token")
+        self.assertFalse(got["ok"])
+        self.assertIn("连接被重置", got["error"])
+
+    def test_stale_session_error_still_retries_once(self):
+        self.stored["sid"] = "session-stale"
+        calls = []
+
+        def spy(_task, session_id, _timeout):
+            calls.append(session_id)
+            if session_id:
+                return ({"final": None, "turn_end": "error"},
+                        "dsh: unknown session id: session-stale")
+            return ({"final": '分析\n\n["A"]', "session_id": "session-fresh"}, None)
+
+        with patch.object(advisor, "_run_headless", side_effect=spy):
+            got = advisor.ask_advisor("她: 在忙", "小美", "暧昧", [])
+        self.assertEqual(calls, ["session-stale", None])
+        self.assertTrue(got["ok"])
+        self.assertEqual(self.stored.get("sid"), "session-fresh")
+
+    def test_failure_is_written_to_log(self):
+        with patch.object(advisor, "_run_headless",
+                          return_value=({"final": None, "turn_end": "error"}, "boom 诊断信息")):
+            advisor.ask_advisor("她: 在忙", "小美", "暧昧", [])
+        self.assertIn("boom 诊断信息", self.log.read_text(encoding="utf-8"))
+
+    def test_log_never_contains_chat_content(self):
+        # 日志是为了排查，不是第二条泄漏渠道
+        with patch.object(advisor, "_run_headless",
+                          return_value=({"final": '这是分析\n\n["这是话术"]'}, None)):
+            advisor.ask_advisor("她今天说在忙", "小美", "暧昧", [])
+        if self.log.exists():
+            logged = self.log.read_text(encoding="utf-8")
+            self.assertNotIn("这是话术", logged)
+            self.assertNotIn("在忙", logged)
 
 
 if __name__ == "__main__":
