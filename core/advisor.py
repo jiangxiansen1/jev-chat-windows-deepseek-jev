@@ -235,12 +235,31 @@ def _looks_like_stale_session(error: str) -> bool:
     return bool(_STALE_SESSION_PAT.search(error or ""))
 
 
+# DSH Desktop 把 dsh 放在带 hash 的 generation 目录里，并且**只注入它自己进程的 PATH**：
+# 从 explorer 双击启动应用时，环境里根本没有那条 PATH（2026-10-11 实际发生过：
+# 点「请教军师」报 dsh-missing，而从 DSH 派生出来的终端里测试却一切正常）。
+#
+# 只搜 host-commands，**不搜 `DSH Desktop\cli\`**：后者那个 dsh.cmd 靠环境变量启动，
+#   "%DSH_DESKTOP_APP_EXECUTABLE%" --expose-internals "%DSH_DESKTOP_DSH_BOOTSTRAP%" %*
+# 那两个变量只存在于 DSH 自己的进程里；从 explorer 调用时是空串，只会得到
+# `'""' is not recognized`（exit 9009）。实测踩过，所以它必须被跳过。
+_DSH_SEARCH_ROOTS = (
+    Path(os.environ.get("APPDATA") or "") / "DSH Desktop" / "host-commands",
+    Path(os.environ.get("LOCALAPPDATA") or "") / "DSH Desktop" / "host-commands",
+)
+# <app>\generations\<hash>\bin\dsh.cmd
+_DSH_GLOB = "*/generations/*/bin/dsh.cmd"
+
+
 def _resolve_dsh() -> str | None:
-    """找 dsh 启动器；找不到返回 None。
+    """找 dsh 启动器；找不到返回 None。依次尝试三条路：
 
-    不硬编码路径：DSH 升级后 `…\\generations\\<hash>\\bin\\dsh.cmd` 里的 hash 会变。
-    先用 PATH 解析（shutil.which 按 PATHEXT 找 .cmd），再用环境变量 DSH_CMD 兜底。
+    1. PATH（shutil.which 按 PATHEXT 找 .cmd）—— 从 DSH 派生的终端里启动就是这样；
+    2. 环境变量 DSH_CMD —— 给用户一个手动指定的口子；
+    3. 自己扫 DSH Desktop 的安装目录，取最新的那个 generation。
+       **这条是必需的**：explorer 双击启动时第 1 条必然失败。
 
+    不硬编码路径：generation 目录名带 hash，DSH 升级后会多一个，所以按 mtime 取最新。
     **刻意不读 config.json**：app/settings.py 的 save() 是整体重写固定字段的，
     往里加 dsh_path 会在用户下次保存设置时被静默丢掉。
     """
@@ -248,7 +267,20 @@ def _resolve_dsh() -> str | None:
     if found:
         return found
     env = (os.environ.get("DSH_CMD") or "").strip()
-    return env or None
+    if env and Path(env).is_file():
+        return env
+    for root in _DSH_SEARCH_ROOTS:
+        try:
+            hits = list(root.glob(_DSH_GLOB))
+        except Exception:
+            continue
+        if hits:
+            try:
+                hits.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            except Exception:
+                pass
+            return str(hits[0])
+    return None
 
 
 def _load_session_id() -> str | None:

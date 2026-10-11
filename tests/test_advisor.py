@@ -7,6 +7,7 @@
   {"type":"final","text":"…"}
 对外暴露 snake_case 键（final / turn_end / session_id），驼峰只在解析层出现。
 """
+import os
 import subprocess
 import tempfile
 import threading
@@ -466,6 +467,91 @@ class FailureDiagnosticsTests(unittest.TestCase):
             logged = self.log.read_text(encoding="utf-8")
             self.assertNotIn("这是话术", logged)
             self.assertNotIn("在忙", logged)
+
+
+class ResolveDshTests(unittest.TestCase):
+    """dsh 的解析：DSH Desktop 只把 dsh 注入**它自己的进程** PATH。
+
+    用户从 explorer 双击启动应用时，环境里没有那条 PATH —— 2026-10-11 真的发生了：
+    点「请教军师」报 dsh-missing（实施者从 DSH 派生的 PowerShell 里测试，所以没发现）。
+    应用必须能自己在磁盘上找到 dsh，不能依赖「恰好从 DSH 的终端里启动」。
+    """
+
+    def test_prefers_path_lookup(self):
+        with patch("shutil.which", return_value=r"C:\on\path\dsh.cmd"):
+            self.assertEqual(advisor._resolve_dsh(), r"C:\on\path\dsh.cmd")
+
+    def test_falls_back_to_env_var(self):
+        with tempfile.TemporaryDirectory() as d:
+            real = Path(d) / "dsh.cmd"
+            real.write_text("@echo off\n", encoding="utf-8")
+            with patch("shutil.which", return_value=None):
+                with patch.dict(os.environ, {"DSH_CMD": str(real)}):
+                    self.assertEqual(advisor._resolve_dsh(), str(real))
+
+    def test_ignores_env_var_pointing_at_a_missing_file(self):
+        with patch("shutil.which", return_value=None):
+            with patch.dict(os.environ, {"DSH_CMD": r"C:\nope\dsh.cmd"}):
+                with patch.object(advisor, "_DSH_SEARCH_ROOTS", ()):
+                    self.assertIsNone(advisor._resolve_dsh())
+
+    def test_self_discovers_dsh_under_host_commands_generations(self):
+        # 本次线上故障的复现：PATH 里没有、DSH_CMD 也没设，
+        # 但磁盘上 DSH Desktop 的 generation 目录里躺着 dsh.cmd
+        # 真实结构：%APPDATA%\DSH Desktop\host-commands\<app>\generations\<hash>\bin\dsh.cmd
+        with tempfile.TemporaryDirectory() as d:
+            gen = Path(d) / "desktop" / "generations" / "abc123" / "bin"
+            gen.mkdir(parents=True)
+            dsh = gen / "dsh.cmd"
+            dsh.write_text("@echo off\n", encoding="utf-8")
+            with patch("shutil.which", return_value=None):
+                with patch.dict(os.environ, {"DSH_CMD": ""}):
+                    with patch.object(advisor, "_DSH_SEARCH_ROOTS", (Path(d),)):
+                        self.assertEqual(advisor._resolve_dsh(), str(dsh))
+
+    def test_self_discovery_prefers_the_newest_generation(self):
+        # generation 目录名带 hash，DSH 升级后会多一个；必须挑最新的
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "desktop" / "generations"
+            old, new = root / "aaa" / "bin", root / "zzz" / "bin"
+            for path in (old, new):
+                path.mkdir(parents=True)
+                (path / "dsh.cmd").write_text("@echo off\n", encoding="utf-8")
+            os.utime(old / "dsh.cmd", (1, 1))  # 把 aaa 那个改成很旧
+            with patch("shutil.which", return_value=None):
+                with patch.dict(os.environ, {"DSH_CMD": ""}):
+                    with patch.object(advisor, "_DSH_SEARCH_ROOTS", (Path(d),)):
+                        self.assertEqual(advisor._resolve_dsh(), str(new / "dsh.cmd"))
+
+    def test_never_picks_the_cli_launcher_that_needs_injected_env(self):
+        """`DSH Desktop\\cli\\<hash>\\bin\\dsh.cmd` 是靠环境变量启动的：
+
+            "%DSH_DESKTOP_APP_EXECUTABLE%" --expose-internals "%DSH_DESKTOP_DSH_BOOTSTRAP%" %*
+
+        那两个变量只存在于 DSH 自己的进程里。从 explorer 启动时它们是空串，
+        跑起来只会得到 `'""' is not recognized`（exit 9009）——2026-10-11 实测踩过。
+        所以它必须被跳过，哪怕磁盘上确实躺着这么一个 dsh.cmd。
+        """
+        with tempfile.TemporaryDirectory() as d:
+            cli = Path(d) / "cli" / "68693d02" / "bin"
+            cli.mkdir(parents=True)
+            (cli / "dsh.cmd").write_text("@echo off\n", encoding="utf-8")
+            good = Path(d) / "host-commands" / "desktop" / "generations" / "9d96" / "bin"
+            good.mkdir(parents=True)
+            usable = good / "dsh.cmd"
+            usable.write_text("@echo off\n", encoding="utf-8")
+            with patch("shutil.which", return_value=None):
+                with patch.dict(os.environ, {"DSH_CMD": ""}):
+                    with patch.object(advisor, "_DSH_SEARCH_ROOTS",
+                                      (Path(d) / "cli", Path(d) / "host-commands")):
+                        self.assertEqual(advisor._resolve_dsh(), str(usable))
+
+    def test_returns_none_when_nothing_found(self):
+        with tempfile.TemporaryDirectory() as d:
+            with patch("shutil.which", return_value=None):
+                with patch.dict(os.environ, {"DSH_CMD": ""}):
+                    with patch.object(advisor, "_DSH_SEARCH_ROOTS", (Path(d),)):
+                        self.assertIsNone(advisor._resolve_dsh())
 
 
 if __name__ == "__main__":

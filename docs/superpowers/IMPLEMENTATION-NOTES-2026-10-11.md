@@ -73,3 +73,23 @@ UTF-8 的「本地AI」被 GBK 解码成「鏈湴AI」，路径直接不存在�
 脚本卡在 `pause` 时进程同样存活，会得到假阳性（本项目第一次"实测通过"就是这么被骗的）。
 要看 `python.exe` 的**命令行里有没有 `main.py`**。
 
+## 六、dsh 的发现路径（第二个环境坑）
+
+**现象**：在 DSH 自己的终端里测一切正常，用户双击 `.bat` 启动后点「请教军师」却报 `dsh-missing`。
+
+**原因**：DSH Desktop 把 `dsh` 的路径**只注入它自己进程的 PATH**，
+用户级与机器级 PATH 里都没有。从 explorer 双击启动的进程环境里自然也没有。
+
+**而且 `DSH Desktop` 下有两个 `dsh.cmd`，只有一个能从外部调用**：
+
+| 路径 | 能否外部调用 |
+|---|---|
+| `DSH Desktop\host-commands\<app>\generations\<hash>\bin\dsh.cmd` | ✅ 内容里 exe 与 bootstrap 全写成绝对路径，自包含 |
+| `DSH Desktop\cli\<hash>\bin\dsh.cmd` | ❌ 内容是 `"%DSH_DESKTOP_APP_EXECUTABLE%" --expose-internals "%DSH_DESKTOP_DSH_BOOTSTRAP%" %*`，靠 DSH 注入的环境变量；外部调用时是空串，报 `'""' is not recognized`（exit 9009） |
+
+**修法**：`core/advisor.py::_resolve_dsh()` 改为三级查找 ——
+PATH → 环境变量 `DSH_CMD` → **自己扫 `host-commands\*\generations\*\bin\dsh.cmd` 并按 mtime 取最新**，
+并**明确排除 `cli` 目录**（generation 目录名带 hash，取最新以适配 DSH 升级）。
+
+**验证要求**：这一类问题**必须在一个剥掉 DSH PATH 的环境里验证** ——
+在 DSH 派生的终端里测永远测不出来（本项目已经因此栽过一次）。
