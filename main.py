@@ -19,6 +19,7 @@ from app.capture import find_wechat_hwnd
 from app.fill import fill, send as send_reply
 from app.overlay import Overlay
 from app.version import VERSION
+from core.advisor import ask_advisor
 from core.engine import analyze
 from core.typesafe_client import TypeSafeAccessDenied
 
@@ -31,6 +32,7 @@ state = {"area": None, "busy": False, "rerun": None, "hwnd": None, "chat": "",
          "typesafe_blocked": False}
 results = queue.Queue()
 update_result = queue.Queue()  # 独立小队列，别跟 results 的 (kind, r, title, revision) 形状搅在一起
+advisor_result = queue.Queue()  # 慢车道结果：(result, 会话名)，形状也跟上面两个都不一样
 TYPESAFE_BLOCKED_STATUS = (
     "TypeSafe 拒绝访问（403），JEV 已暂停；请联系 TypeSafe，或在设置中关闭 JEV。"
 )
@@ -119,6 +121,48 @@ def check_update_bg():
     r = update.check_latest(VERSION)
     if r:
         update_result.put(r)
+
+
+def advisor_context(title):
+    """构造慢车道的输入：文字记录 + 对方最近几句（后者给出口过滤判回声用）。
+
+    their_recent 取的是**纯文本**，不带「说话人:」前缀 ——
+    core.advisor.filter_candidates 按归一化后完全相等判回声，带了前缀就判不出来。
+    """
+    chat = chat_of(title)
+    recent = list(chat["history"])[-settings.context():]
+    lines = []
+    for who, text, name in recent:
+        speaker = "我" if who == "me" else (name or "对方")
+        lines.append(f"{speaker}: {text}")
+    their_recent = [text for who, text, _name in recent if who == "her"]
+    return "\n".join(lines), their_recent
+
+
+def advisor_bg(transcript, their_recent, title):
+    """慢车道后台线程：只跑子进程和网络，结果丢队列，UI 只在 tick() 里动。
+
+    ask_advisor 自己已经把失败折成返回值，这里再兜一层是为了
+    「它自己抛异常」这种谁也没预料到的情况也不会把线程打死。
+    """
+    try:
+        r = ask_advisor(transcript, title, settings.relationship(), their_recent)
+    except Exception as e:
+        r = {"ok": False, "analysis": "", "candidates": [], "elapsed": 0.0,
+             "error": str(e)[:200] or "run-failed", "session_id": ""}
+    advisor_result.put((r, title))
+
+
+def start_advisor(title):
+    """手动触发慢车道。任何失败都只影响侧栏，绝不碰快车道的候选。"""
+    transcript, their_recent = advisor_context(title)
+    if not transcript.strip():
+        ov.set_advisor_result({"ok": False, "analysis": "", "candidates": [],
+                               "elapsed": 0.0, "error": "no-context", "session_id": ""})
+        return
+    ov.set_advisor_busy(True)
+    threading.Thread(target=advisor_bg, args=(transcript, their_recent, title),
+                     daemon=True).start()
 
 
 def start_analyze(title, msgs):
@@ -229,6 +273,11 @@ def tick():
         while not update_result.empty():
             latest, url = update_result.get()
             ov.set_update(latest, url)
+        while not advisor_result.empty():
+            r, title = advisor_result.get()
+            ov.set_advisor_busy(False)
+            if title == ov.current_chat():
+                ov.set_advisor_result(r)
         while not results.empty():
             kind, r, title, revision = results.get()
             state["busy"] = False
@@ -281,7 +330,8 @@ if __name__ == "__main__":  # Windows 的 spawn 会让子进程重新执行本�
     capture_on = multiprocessing.Event()  # 父子进程共用的开关，置位=采集
     ov = Overlay(on_fill=fill_reply, on_toggle_capture=on_toggle_capture,
                  on_target_change=on_target_change,
-                 result_of=lambda t: chats.get(t, {}).get("result"))
+                 result_of=lambda t: chats.get(t, {}).get("result"),
+                 on_ask_advisor=start_advisor)
     child = None
     try:
         state["hwnd"] = find_wechat_hwnd()

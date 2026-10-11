@@ -16,6 +16,7 @@ from qfluentwidgets import (
 )
 
 from app import settings
+from app.advisor_panel import AdvisorPanel
 from app.jev_display import (
     choice_distribution, choice_summary, danger_summary, finite_number,
     probability_summary,
@@ -152,9 +153,11 @@ class _ReplyCard(_Surface):
 
 
 class Overlay:
-    def __init__(self, on_fill, on_toggle_capture=None, on_target_change=None, result_of=None):
+    def __init__(self, on_fill, on_toggle_capture=None, on_target_change=None, result_of=None,
+                 on_ask_advisor=None):
         """result_of(会话名) → 那个会话上次的结果或 None；切着看别的会话时用它把旧结果放回来。
-        on_target_change(会话名, 人名) → 用户在群里挑了回复对象。"""
+        on_target_change(会话名, 人名) → 用户在群里挑了回复对象。
+        on_ask_advisor(会话名) → 用户点了「请教军师」，交给 main 去起慢车道后台任务。"""
         self.app = QApplication.instance() or QApplication([])
         setTheme(Theme.LIGHT)
         setThemeColor(_GREEN, save=False)
@@ -162,6 +165,7 @@ class Overlay:
         self.on_toggle_capture = on_toggle_capture
         self.on_target_change = on_target_change
         self.result_of = result_of
+        self.on_ask_advisor = on_ask_advisor
         self.cands = []
         self.cards = []
         self._busy = False
@@ -441,6 +445,19 @@ class Overlay:
         self.replyBox = QVBoxLayout()
         self.replyBox.setSpacing(10)
         body.addLayout(self.replyBox)
+
+        # 慢车道入口：手动触发，不参与快车道的自动流程。
+        # 它慢、贵，而且**永远不会挡住快车道** —— 失败只反映在侧栏里。
+        self.advisorButton = PushButton("请教军师")
+        self.advisorButton.setAccessibleName("请教狗头军师")
+        self.advisorButton.setToolTip("把当前这段对话交给本地狗头军师深入分析；"
+                                      "约十几秒，消耗比快车道多，失败也不影响上面的候选")
+        self.advisorButton.clicked.connect(self._ask_advisor)
+        body.addWidget(self.advisorButton)
+        self.advisorPanel = AdvisorPanel(on_fill=self._fill_text)
+        self.advisorPanel.hide()
+        body.addWidget(self.advisorPanel)
+
         self.referenceNote = _label("AI 建议仅供参考，按你的语气调整后再发送。", 11, _MUTED)
         self.referenceNote.hide()
         body.addWidget(self.referenceNote)
@@ -458,6 +475,40 @@ class Overlay:
         body.addWidget(self.feed)
         self._history_title()
         body.addStretch(1)
+
+    # --- 慢车道（狗头军师）-------------------------------------------------
+
+    def _ask_advisor(self):
+        """用户点「请教军师」：交给 main 起后台任务，UI 线程不碰网络和子进程。"""
+        if self.on_ask_advisor is None:
+            return
+        try:
+            self.on_ask_advisor(self.current_chat())
+        except Exception as e:
+            self.set_status("未能启动军师分析。", "error")
+            self.log(f"[军师启动失败] {type(e).__name__}: {e}")
+
+    def set_advisor_busy(self, busy):
+        self.advisorPanel.show()
+        self.advisorPanel.set_busy(busy)
+        self.advisorButton.setEnabled(not busy)
+
+    def set_advisor_result(self, result):
+        self.advisorPanel.show()
+        self.advisorPanel.set_result(result)
+
+    def _fill_text(self, text):
+        """把一段文本填入微信输入框（填入 ≠ 发送）。军师给的话术走这条路。"""
+        self.cancel_auto_send("已改为手动选择，自动发送已取消。")
+        try:
+            self.on_fill(text)
+        except Exception as e:
+            import traceback
+            self.set_status("未能填入，请确认微信窗口可用后重试，或复制回复。", "error")
+            self.log(f"[填入失败] {type(e).__name__}: {e}")
+            self.log(f"[填入失败堆栈] {' '.join(traceback.format_exc().split())[:300]}")
+            return
+        self.set_status("已尝试填入，请在微信确认内容后发送。", "success")
 
     def _build_settings(self):
         self.settingsPage, body = self._scroll_page()
