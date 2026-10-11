@@ -55,3 +55,21 @@
 - 自动发送保持关闭（`config.json` 中 `auto_send: false`；代码默认值亦为 `False`）
 - 不注入微信、不解密其数据库、不读取进程内存；截图帧仅在内存处理
 - API Key 只存 Windows 用户环境变量，不落任何文件
+
+## 五、本地启动方式与一个编码坑
+
+**启动**：双击 `D:\本地AI\启动微信军师.bat`
+（等价于在 `D:\本地AI\jev-advisor` 下用 venv 解释器执行 `main.py`）。
+备选：在该目录开终端，执行 `.venv\Scripts\python.exe main.py`。
+
+**`.bat` 必须存成 GBK（CP936），绝不能存 UTF-8。**
+`cmd.exe` 按系统代码页读批处理文件，而本项目路径本身含中文（`D:\本地AI\`）：
+UTF-8 的「本地AI」被 GBK 解码成「鏈湴AI」，路径直接不存在；更糟的是错位字节会把命令本身切碎——
+实测 `if errorlevel` 被切成 `rrorlevel`、`echo` 被切成 `o`，屏幕上一串「不是内部或外部命令」。
+本项目第一版 bat 由只写 UTF-8 的工具生成，用户双击即失败；改为 GBK 编码 + 显式 `chcp 936` 后，
+实测可正常启动（`python.exe main.py` 与 multiprocessing 采集子进程都在）。
+
+**验证教训**：判断 bat 有没有真正启动应用，**不能看「进程是否存活」**——
+脚本卡在 `pause` 时进程同样存活，会得到假阳性（本项目第一次"实测通过"就是这么被骗的）。
+要看 `python.exe` 的**命令行里有没有 `main.py`**。
+
