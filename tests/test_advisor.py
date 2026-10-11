@@ -7,7 +7,12 @@
   {"type":"final","text":"…"}
 对外暴露 snake_case 键（final / turn_end / session_id），驼峰只在解析层出现。
 """
+import tempfile
+import threading
+import time
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from core import advisor
 
@@ -113,6 +118,27 @@ class SplitAnswerTests(unittest.TestCase):
         analysis, cands = advisor.split_answer("他用了 [图片] 这个表情。")
         self.assertEqual(cands, [])
 
+    def test_candidates_inside_markdown_fence_with_brackets_in_text(self):
+        # 2026-10-11 真机抓到的 bug：狗头军师把候选放进 ```json 围栏，
+        # 而某条候选自己含方括号（"我这边刚[具体小事]"）。
+        # 「最后一个 [ 到最后一个 ]」的朴素切法会取到候选内部的 [，json.loads 失败，
+        # 整批候选被静默丢掉 —— 用户看到的是有分析、没话术。
+        answer = (
+            "她的意图是先确认当下不方便。\n\n"
+            "```json\n"
+            "[\n"
+            '  "刚看你在忙就没往下打扰。",\n'
+            '  "我这边刚[具体小事]，你忙完再回我。",\n'
+            '  "收到，先忙你的。"\n'
+            "]\n"
+            "```"
+        )
+        analysis, cands = advisor.split_answer(answer)
+        self.assertEqual(len(cands), 3)
+        self.assertIn("[具体小事]", cands[1])
+        self.assertNotIn("```", analysis)
+        self.assertIn("她的意图", analysis)
+
 
 class FilterCandidatesTests(unittest.TestCase):
     """spec §8 的出口过滤：慢车道返回的一切文本进 UI 前必须过这几道。
@@ -147,6 +173,137 @@ class FilterCandidatesTests(unittest.TestCase):
     def test_handles_empty_and_blank_input(self):
         self.assertEqual(advisor.filter_candidates([], []), [])
         self.assertEqual(advisor.filter_candidates(["", "   "], []), [])
+
+
+class AskAdvisorTests(unittest.TestCase):
+    """Task 6：dsh 调用、超时、互斥、会话自举。
+
+    _resolve_dsh / _run_headless / _load_session_id / _save_session_id / _clear_session_id
+    是本层与外部世界的边界，测试只 mock 它们 —— 边界若改名，patch 会直接报错，
+    因此不会出现「实现里函数名拼错、测试却照样绿」。
+    """
+
+    def setUp(self):
+        self.stored = {}
+        self._start_patch("_resolve_dsh", return_value=r"C:\fake\dsh.cmd")
+        self._start_patch("_load_session_id", side_effect=lambda: self.stored.get("sid"))
+        self._start_patch("_save_session_id",
+                          side_effect=lambda sid: self.stored.__setitem__("sid", sid))
+        self._start_patch("_clear_session_id", side_effect=lambda: self.stored.pop("sid", None))
+
+    def _start_patch(self, name, **kwargs):
+        p = patch.object(advisor, name, **kwargs)
+        p.start()
+        self.addCleanup(p.stop)
+
+    # --- Review Focus #3：OCR 拿到空上下文（窗口最小化/被遮挡）时不得发起调用 ---
+
+    def test_empty_transcript_refuses_to_call_dsh(self):
+        with patch.object(advisor, "_run_headless") as run:
+            got = advisor.ask_advisor("   ", "小美", "暧昧", [])
+        run.assert_not_called()
+        self.assertFalse(got["ok"])
+        self.assertEqual(got["error"], "no-context")
+
+    def test_missing_dsh_reports_dsh_missing(self):
+        with patch.object(advisor, "_resolve_dsh", return_value=None):
+            got = advisor.ask_advisor("她: 在忙", "小美", "暧昧", [])
+        self.assertFalse(got["ok"])
+        self.assertEqual(got["error"], "dsh-missing")
+
+    # --- Review Focus #4：dsh 卡住不得让按钮永久点不动 ---
+
+    def test_timeout_returns_error_and_releases_lock(self):
+        with patch.object(advisor, "_run_headless", side_effect=TimeoutError):
+            first = advisor.ask_advisor("她: 在忙", "小美", "暧昧", [])
+        self.assertFalse(first["ok"])
+        self.assertEqual(first["error"], "timeout")
+        with patch.object(advisor, "_run_headless",
+                          return_value=({"final": '分析\n\n["A"]'}, None)):
+            second = advisor.ask_advisor("她: 在忙", "小美", "暧昧", [])
+        self.assertTrue(second["ok"], "超时后锁没释放，第二次调用被自己挡住了")
+
+    # --- Review Focus #5：连点两次不得让两个进程抢同一个会话 ---
+
+    def test_second_call_while_busy_returns_busy_immediately(self):
+        gate = threading.Event()
+
+        def slow(*_a, **_k):
+            gate.wait(5)
+            return ({"final": '分析\n\n["A"]'}, None)
+
+        with patch.object(advisor, "_run_headless", side_effect=slow):
+            worker = threading.Thread(target=advisor.ask_advisor,
+                                      args=("她: 在忙", "小美", "暧昧", []))
+            worker.start()
+            time.sleep(0.3)
+            busy = advisor.ask_advisor("她: 在忙", "小美", "暧昧", [])
+            gate.set()
+            worker.join(5)
+        self.assertEqual(busy["error"], "busy")
+
+    def test_ok_path_returns_analysis_and_filtered_candidates(self):
+        with patch.object(advisor, "_run_headless",
+                          return_value=({"final": '分析内容\n\n["嗯，你先忙", "在忙"]'}, None)):
+            got = advisor.ask_advisor("她: 在忙", "小美", "暧昧", ["在忙"])
+        self.assertTrue(got["ok"])
+        self.assertIn("分析内容", got["analysis"])
+        self.assertEqual(got["candidates"], ["嗯，你先忙"])
+
+    def test_failure_result_is_never_ok(self):
+        with patch.object(advisor, "_run_headless",
+                          return_value=({"final": None, "turn_end": "error"}, "dsh 退出码 1")):
+            got = advisor.ask_advisor("她: 在忙", "小美", "暧昧", [])
+        self.assertFalse(got["ok"])
+        self.assertEqual(got["candidates"], [])
+        self.assertEqual(got["analysis"], "")
+
+    # --- 会话自举：dsh 对未知 --session-id 会在任务运行前直接失败 ---
+
+    def test_first_call_omits_session_id_when_none_stored(self):
+        seen = []
+
+        def spy(_task, session_id, _timeout):
+            seen.append(session_id)
+            return ({"final": '分析\n\n["A"]', "session_id": "session-new"}, None)
+
+        with patch.object(advisor, "_run_headless", side_effect=spy):
+            advisor.ask_advisor("她: 在忙", "小美", "暧昧", [])
+        self.assertIsNone(seen[0], "首次就带了 --session-id，dsh 会因未知 id 直接失败")
+
+    def test_stores_returned_session_id_and_reuses_it_next_time(self):
+        seen = []
+
+        def spy(_task, session_id, _timeout):
+            seen.append(session_id)
+            return ({"final": '分析\n\n["A"]', "session_id": "session-new"}, None)
+
+        with patch.object(advisor, "_run_headless", side_effect=spy):
+            advisor.ask_advisor("她: 在忙", "小美", "暧昧", [])
+            advisor.ask_advisor("她: 在忙", "小美", "暧昧", [])
+        self.assertIsNone(seen[0])
+        self.assertEqual(seen[1], "session-new")
+
+    def test_ok_result_reports_session_id(self):
+        with patch.object(advisor, "_run_headless",
+                          return_value=({"final": '分析\n\n["A"]', "session_id": "session-xyz"}, None)):
+            got = advisor.ask_advisor("她: 在忙", "小美", "暧昧", [])
+        self.assertEqual(got["session_id"], "session-xyz")
+
+    def test_stale_session_id_is_cleared_and_retried_without_it(self):
+        # 本地记的 id 失效（sessions 被清过）时，应清掉记录并自动重试一次不带 id，
+        # 而不是把这个错误丢给用户
+        self.stored["sid"] = "session-stale"
+
+        def spy(_task, session_id, _timeout):
+            if session_id:
+                return ({"final": None, "turn_end": "error"}, "unknown session id")
+            return ({"final": '分析\n\n["A"]', "session_id": "session-fresh"}, None)
+
+        with patch.object(advisor, "_run_headless", side_effect=spy):
+            got = advisor.ask_advisor("她: 在忙", "小美", "暧昧", [])
+        self.assertTrue(got["ok"])
+        self.assertEqual(self.stored.get("sid"), "session-fresh")
 
 
 if __name__ == "__main__":

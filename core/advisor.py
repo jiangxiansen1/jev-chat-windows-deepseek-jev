@@ -14,6 +14,12 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
+import threading
+import time
+from pathlib import Path
 
 try:  # 与 draft.py 一致：既支持包导入，也支持脚本直接跑
     from . import draft
@@ -107,38 +113,53 @@ def parse_events(stdout: str) -> dict:
     return {"final": final, "turn_end": turn_end, "session_id": session_id}
 
 
+def _locate_candidates(text: str) -> tuple[int, int, list[str]] | None:
+    """从后往前找最靠后的一段「能 json.loads 成非空数组」的 [...]。
+
+    不能只取「最后一个 [ 到最后一个 ]」：候选文本自己可能含方括号。
+    真机上拿到过候选 `我这边刚[具体小事，比如煮了锅面/加班到九点]`，
+    那种朴素切法会取到候选内部的 `[`，切出来的不是合法 JSON，整批候选被静默丢掉。
+    """
+    end = text.rfind("]")
+    while end != -1:
+        start = text.rfind("[", 0, end + 1)
+        while start != -1:
+            chunk = text[start:end + 1]
+            try:
+                parsed = json.loads(chunk)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, list) and parsed:
+                try:
+                    cands = draft._parse_candidates(chunk)
+                except Exception:
+                    cands = []
+                if cands:
+                    return start, end, cands
+            start = text.rfind("[", 0, start)
+        end = text.rfind("]", 0, end)
+    return None
+
+
 def split_answer(answer: str) -> tuple[str, list[str]]:
     """把慢车道的回答切成（精简分析, 话术列表）。
 
-    候选固定放在答案末尾，是一个 JSON 数组；其余部分算分析。
-
-    先要求整段能通过 json.loads 且是**非空数组**才算候选块 —— 否则分析里出现的
-    `[图片]` 这种方括号会被误判成候选。通过门禁后再交给 draft._parse_candidates
-    做清洗（剥括号/引号/编号/末尾句号），复用现成解析器，不重复实现。
+    候选固定放在答案末尾，是一个 JSON 数组（常被包在 ```json 围栏里）；
+    其余部分算分析。解析候选时复用 draft._parse_candidates 做清洗
+    （剥括号/引号/编号/末尾句号），不重复实现。
     """
     text = (answer or "").strip()
     if not text:
         return "", []
-    end = text.rfind("]")
-    if end == -1:
+    found = _locate_candidates(text)
+    if not found:
         return text, []
-    start = text.rfind("[", 0, end + 1)
-    if start == -1:
-        return text, []
-    chunk = text[start:end + 1]
-    try:
-        parsed = json.loads(chunk)
-    except Exception:
-        return text, []
-    if not isinstance(parsed, list) or not parsed:
-        return text, []
-    try:
-        cands = draft._parse_candidates(chunk)
-    except Exception:
-        cands = []
-    if not cands:
-        return text, []
+    start, end, cands = found
     analysis = (text[:start] + text[end + 1:]).strip()
+    # 候选写在 ```json 围栏里时，围栏会残留在分析两端，逐行去掉
+    analysis = "\n".join(
+        line for line in analysis.splitlines() if not line.strip().startswith("```")
+    ).strip()
     return analysis, cands
 
 
@@ -178,3 +199,145 @@ def filter_candidates(cands: list[str], their_recent: list[str]) -> list[str]:
         if len(out) >= MAX_CANDIDATES:
             break
     return out
+
+
+# --- 与 dsh 的边界：解析启动器、读写会话 id、起子进程 --------------------------
+
+ADVISOR_CWD = r"D:\本地AI\jev-advisor-data\workspace"
+ADVISOR_TIMEOUT = 60.0
+_STATE_FILE = Path(r"D:\本地AI\jev-advisor-data\advisor_session.json")
+_BUSY = threading.Lock()
+
+
+def _resolve_dsh() -> str | None:
+    """找 dsh 启动器；找不到返回 None。
+
+    不硬编码路径：DSH 升级后 `…\\generations\\<hash>\\bin\\dsh.cmd` 里的 hash 会变。
+    先用 PATH 解析（shutil.which 按 PATHEXT 找 .cmd），再用环境变量 DSH_CMD 兜底。
+
+    **刻意不读 config.json**：app/settings.py 的 save() 是整体重写固定字段的，
+    往里加 dsh_path 会在用户下次保存设置时被静默丢掉。
+    """
+    found = shutil.which("dsh") or shutil.which("dsh.cmd")
+    if found:
+        return found
+    env = (os.environ.get("DSH_CMD") or "").strip()
+    return env or None
+
+
+def _load_session_id() -> str | None:
+    try:
+        data = json.loads(_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    sid = data.get("session_id") if isinstance(data, dict) else None
+    return sid if isinstance(sid, str) and sid else None
+
+
+def _save_session_id(session_id: str) -> None:
+    try:
+        _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _STATE_FILE.write_text(json.dumps({"session_id": session_id}, ensure_ascii=False),
+                               encoding="utf-8")
+    except Exception:
+        pass  # 记不住只失去上下文连续性，不该让本次调用失败
+
+
+def _clear_session_id() -> None:
+    try:
+        _STATE_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _run_headless(task: str, session_id: str | None, timeout: float) -> tuple[dict, str | None]:
+    """起一次 dsh headless 调用，返回 (事件字典, 错误信息或 None)。
+
+    两个平台细节：
+      - 任务走 stdin（末尾的 `-`）：中文 + 引号 + emoji 拼进命令行必然出事；
+      - 必须 `cmd /c`：dsh 实际是 .cmd 批处理，CreateProcess 不能直接执行它。
+    """
+    dsh = _resolve_dsh()
+    if not dsh:
+        return {}, "dsh-missing"
+    argv = ["cmd", "/c", dsh, "--profile", "headless", "--json"]
+    if session_id:
+        argv += ["--session-id", session_id]
+    argv.append("-")
+    try:
+        proc = subprocess.run(
+            argv,
+            input=task.encode("utf-8"),
+            capture_output=True,
+            timeout=timeout,
+            cwd=ADVISOR_CWD,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except FileNotFoundError:
+        return {}, "dsh-not-found"
+    events = parse_events(proc.stdout.decode("utf-8", "replace"))
+    if proc.returncode != 0:
+        lines = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+        return events, (lines[-1][:200] if lines else f"dsh 退出码 {proc.returncode}")
+    return events, None
+
+
+def ask_advisor(transcript: str, session_name: str, relationship: str,
+                their_recent: list[str] | None = None,
+                timeout: float = ADVISOR_TIMEOUT) -> dict:
+    """问一次慢车道，返回 spec §8 的契约 dict。
+
+    顺序就是用户能感知到的行为：
+      空上下文  → 不发起调用（窗口最小化/被遮挡时 OCR 会给空结果）
+      找不到 dsh → dsh-missing
+      已有任务在跑 → 立刻 busy（连点按钮不该起两个进程抢同一个会话）
+      超时/失败 → 只反映在返回值里，**绝不阻塞、绝不清空快车道**
+    """
+    started = time.perf_counter()
+
+    def result(ok: bool, error: str | None, analysis: str = "",
+               cands: list[str] | None = None, session_id: str | None = None) -> dict:
+        return {"ok": ok, "analysis": analysis, "candidates": cands or [],
+                "elapsed": time.perf_counter() - started, "error": error,
+                "session_id": session_id or ""}
+
+    if not (transcript or "").strip():
+        return result(False, "no-context")
+    if _resolve_dsh() is None:
+        return result(False, "dsh-missing")
+    if not _BUSY.acquire(blocking=False):
+        return result(False, "busy")
+    try:
+        task = build_task(transcript, session_name, relationship)
+        session_id = _load_session_id()
+        try:
+            events, error = _run_headless(task, session_id, timeout)
+        except (subprocess.TimeoutExpired, TimeoutError):
+            return result(False, "timeout")
+        except Exception as exc:
+            return result(False, str(exc)[:200] or "run-failed")
+        if error and session_id:
+            # 本地记的 id 失效了（sessions 被清过）：清掉并自动重试一次不带 id，
+            # 而不是把这个错误丢给用户
+            _clear_session_id()
+            session_id = None
+            try:
+                events, error = _run_headless(task, None, timeout)
+            except (subprocess.TimeoutExpired, TimeoutError):
+                return result(False, "timeout")
+            except Exception as exc:
+                return result(False, str(exc)[:200] or "run-failed")
+        fresh = events.get("session_id")
+        if isinstance(fresh, str) and fresh:
+            _save_session_id(fresh)
+        if error:
+            return result(False, error, session_id=fresh or session_id)
+        final = events.get("final")
+        if not final:
+            return result(False, "no-final", session_id=fresh or session_id)
+        analysis, cands = split_answer(final)
+        return result(True, None, analysis,
+                      filter_candidates(cands, list(their_recent or [])),
+                      session_id=fresh or session_id)
+    finally:
+        _BUSY.release()
