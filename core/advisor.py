@@ -140,3 +140,41 @@ def split_answer(answer: str) -> tuple[str, list[str]]:
         return text, []
     analysis = (text[:start] + text[end + 1:]).strip()
     return analysis, cands
+
+
+MAX_CANDIDATE_CHARS = 200  # 超过这个长度就不是一句话了，是分析误入了候选数组
+MAX_CANDIDATES = 3
+
+
+def filter_candidates(cands: list[str], their_recent: list[str]) -> list[str]:
+    """出口过滤：慢车道返回的候选进 UI 之前必须过这几道。
+
+    慢车道的文本出自一个会阅读聊天的 agent，一律当**不可信数据**处理。
+    规则复用 draft.py 既有的归一化与正则（只调用，不修改它）：
+
+    1. 去重：忽略空白、标点、大小写；
+    2. 长度上限 MAX_CANDIDATE_CHARS；
+    3. 注入形状：命中 draft._INJECT 的丢弃；
+    4. 禁鹦鹉学舌：与对方最近消息归一化后**完全相等**的丢弃（纯笑声例外）
+       —— 刻意不做子串匹配，否则「好」「嗯」这类最常见的短回复会被大量误杀；
+    5. 最多 MAX_CANDIDATES 条。
+    """
+    echo = {draft._norm(t) for t in (their_recent or [])}
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in cands or []:
+        text = (raw or "").strip()
+        norm = draft._norm(text)
+        if not norm or norm in seen:
+            continue
+        if len(text) > MAX_CANDIDATE_CHARS:
+            continue
+        if draft._INJECT.search(text):
+            continue
+        if norm in echo and not draft._LAUGH.match(norm):
+            continue
+        seen.add(norm)
+        out.append(text)
+        if len(out) >= MAX_CANDIDATES:
+            break
+    return out
