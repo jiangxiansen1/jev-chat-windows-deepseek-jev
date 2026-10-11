@@ -20,6 +20,9 @@ else:
 _CONFIG = os.path.join(_ROOT, "config.json")
 _DEFAULT_RELATIONSHIP = "romantic partners"
 _DEFAULT_CONTEXT = 10
+_DEFAULT_ADVISOR_CONTEXT = 80
+_ADVISOR_CONTEXT_MIN = 10
+_ADVISOR_CONTEXT_MAX = 300
 _DEFAULT_ADVISOR_TIMEOUT = 60
 _ADVISOR_TIMEOUT_MIN = 10
 _ADVISOR_TIMEOUT_MAX = 300
@@ -125,6 +128,20 @@ def advisor_timeout() -> int:
     return max(_ADVISOR_TIMEOUT_MIN, min(_ADVISOR_TIMEOUT_MAX, n))
 
 
+def advisor_context() -> int:
+    """慢车道看最近多少条聊天记录。
+
+    **刻意与快车道的 context 分开**：快车道每来一条新消息就跑一次，上下文越大越慢越贵，
+    所以它用 3~30 的小值；慢车道是手动触发的深度分析，本来就慢，看 80 条才有背景。
+    """
+    try:
+        with open(_CONFIG, encoding="utf-8") as f:
+            n = int(json.load(f).get("advisor_context", _DEFAULT_ADVISOR_CONTEXT))
+    except (OSError, ValueError, TypeError):
+        return _DEFAULT_ADVISOR_CONTEXT
+    return max(_ADVISOR_CONTEXT_MIN, min(_ADVISOR_CONTEXT_MAX, n))
+
+
 def _get_key(env_name: str) -> str:
     """进程环境优先；没有就读注册表并带进进程环境，之后 core/ 里按 os.environ 读就有了。"""
     v = os.environ.get(env_name, "").strip()
@@ -194,7 +211,8 @@ def save(key_text: str | None, relationship_text: str, context_n: int | None = N
          auto_send_on: bool | None = None, typesafe_key_text: str | None = None,
          judge_provider_text: str | None = None,
          advisor_enabled_on: bool | None = None,
-         advisor_timeout_n: int | None = None) -> None:
+         advisor_timeout_n: int | None = None,
+         advisor_context_n: int | None = None) -> None:
     """每个参数为空/None = 保留当前值。key 只写进程环境 + HKCU\\Environment，不写文件。"""
     if key_text:
         _set_key(_ENV, key_text)
@@ -212,6 +230,9 @@ def save(key_text: str | None, relationship_text: str, context_n: int | None = N
     check = check_update() if check_update_on is None else bool(check_update_on)
     auto = False if sys.platform == "darwin" else (auto_send() if auto_send_on is None else bool(auto_send_on))
     advisor_on = advisor_enabled() if advisor_enabled_on is None else bool(advisor_enabled_on)
+    advisor_ctx = (advisor_context() if advisor_context_n is None
+                   else max(_ADVISOR_CONTEXT_MIN,
+                            min(_ADVISOR_CONTEXT_MAX, int(advisor_context_n))))
     advisor_to = (advisor_timeout() if advisor_timeout_n is None
                   else max(_ADVISOR_TIMEOUT_MIN,
                            min(_ADVISOR_TIMEOUT_MAX, int(advisor_timeout_n))))
@@ -220,7 +241,8 @@ def save(key_text: str | None, relationship_text: str, context_n: int | None = N
                    "judge_provider": judge,
                    "reply_target": target, "style": style_v, "thinking": think,
                    "check_update": check, "auto_send": auto,
-                   "advisor_enabled": advisor_on, "advisor_timeout": advisor_to},
+                   "advisor_enabled": advisor_on, "advisor_timeout": advisor_to,
+                   "advisor_context": advisor_ctx},
                   f, ensure_ascii=False)
 
 def set_auto_send(enabled: bool) -> None:

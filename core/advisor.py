@@ -28,6 +28,28 @@ except ImportError:
     import draft
 
 
+def format_transcript(messages: list, limit: int) -> tuple[str, list[str]]:
+    """把会话历史格式化成慢车道要的 (文字记录, 对方最近几句)。
+
+    messages 的元素是 (who, text, name)：who ∈ {"me", "her"}，name 是群聊里的发言人
+    （单聊、或自己说的话为 None）；也接受 (who, text) 二元组。
+
+    their_recent 返回**纯文本**、不带「说话人:」前缀 —— 出口过滤
+    （filter_candidates）按归一化后完全相等判回声，带了前缀就再也判不出鹦鹉学舌。
+    """
+    recent = list(messages or [])[-max(1, int(limit)):]
+    lines: list[str] = []
+    their: list[str] = []
+    for entry in recent:
+        who = entry[0]
+        text = entry[1] if len(entry) > 1 else ""
+        name = entry[2] if len(entry) > 2 else None
+        lines.append(f"{'我' if who == 'me' else (name or '对方')}: {text}")
+        if who == "her":
+            their.append(text)
+    return "\n".join(lines), their
+
+
 _MARK_OPEN = "<<<对话开始>>>"
 _MARK_CLOSE = "<<<对话结束>>>"
 

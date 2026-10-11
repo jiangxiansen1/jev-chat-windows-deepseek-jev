@@ -554,5 +554,70 @@ class ResolveDshTests(unittest.TestCase):
                         self.assertIsNone(advisor._resolve_dsh())
 
 
+class AdvisorContextTests(unittest.TestCase):
+    """慢车道该看多少历史。
+
+    用户反馈「军师看得太少」：原来慢车道借用快车道的 `context`（用户设的 5 条），
+    分析自然缺背景。改成独立设置，默认 80 条 —— 它本来就慢、本来就该看更多，
+    没理由跟「每来一条消息就跑一次」的快车道共用一个数字。
+    """
+
+    def test_format_transcript_limits_to_requested_count(self):
+        msgs = [("her", f"第{i}句", None) for i in range(1, 101)]
+        text, their = advisor.format_transcript(msgs, 80)
+        self.assertNotIn("第20句", text)
+        self.assertIn("第21句", text)
+        self.assertIn("第100句", text)
+        self.assertEqual(len(their), 80)
+
+    def test_format_transcript_labels_speakers(self):
+        text, _ = advisor.format_transcript(
+            [("me", "好的", None), ("her", "在忙", "小美")], 10)
+        self.assertIn("我: 好的", text)
+        self.assertIn("小美: 在忙", text)
+
+    def test_format_transcript_names_unnamed_other_as_duifang(self):
+        text, _ = advisor.format_transcript([("her", "在忙", None)], 10)
+        self.assertIn("对方: 在忙", text)
+
+    def test_format_transcript_their_recent_is_plain_text(self):
+        # 出口过滤（filter_candidates）按归一化后**完全相等**判回声，
+        # 带了「说话人:」前缀就再也判不出鹦鹉学舌
+        _, their = advisor.format_transcript(
+            [("her", "在忙", "小美"), ("me", "好的", None)], 10)
+        self.assertEqual(their, ["在忙"])
+
+    def test_format_transcript_accepts_two_tuples(self):
+        text, their = advisor.format_transcript([("her", "在忙")], 10)
+        self.assertIn("对方: 在忙", text)
+        self.assertEqual(their, ["在忙"])
+
+    def test_format_transcript_on_empty_history(self):
+        self.assertEqual(advisor.format_transcript([], 10), ("", []))
+
+
+class AdvisorContextSettingTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = Path(self.tmp.name) / "config.json"
+        p = patch.object(settings, "_CONFIG", str(self.cfg))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_defaults_to_eighty_lines(self):
+        self.assertEqual(settings.advisor_context(), 80)
+
+    def test_is_clamped_to_a_sane_range(self):
+        self.cfg.write_text('{"advisor_context": 1}', encoding="utf-8")
+        self.assertEqual(settings.advisor_context(), 10)
+        self.cfg.write_text('{"advisor_context": 9999}', encoding="utf-8")
+        self.assertEqual(settings.advisor_context(), 300)
+
+    def test_reads_configured_value(self):
+        self.cfg.write_text('{"advisor_context": 150}', encoding="utf-8")
+        self.assertEqual(settings.advisor_context(), 150)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -23,7 +23,7 @@ from app.capture import find_wechat_hwnd
 from app.fill import fill, send as send_reply
 from app.overlay import Overlay
 from app.version import VERSION
-from core.advisor import ask_advisor
+from core.advisor import ask_advisor, format_transcript
 from core.engine import analyze
 from core.typesafe_client import TypeSafeAccessDenied
 
@@ -43,7 +43,9 @@ TYPESAFE_BLOCKED_STATUS = (
 
 
 def chat_of(title):
-    return chats.setdefault(title, {"history": deque(maxlen=60), "result": None, "rev": 0,
+    # maxlen 要容得下慢车道想看的历史（它默认看 80 条、可配到 300）；
+    # 快车道只从里面取最近几条，所以放大缓存不影响它的开销。
+    return chats.setdefault(title, {"history": deque(maxlen=300), "result": None, "rev": 0,
                                     "target": None, "senders": []})
 
 
@@ -127,20 +129,13 @@ def check_update_bg():
         update_result.put(r)
 
 
-def advisor_context(title):
+def advisor_input(title):
     """构造慢车道的输入：文字记录 + 对方最近几句（后者给出口过滤判回声用）。
 
-    their_recent 取的是**纯文本**，不带「说话人:」前缀 ——
-    core.advisor.filter_candidates 按归一化后完全相等判回声，带了前缀就判不出来。
+    **用 settings.advisor_context()（默认 80 条），不用快车道那个 context**：
+    慢车道是手动触发的深度分析，看的历史必须比「每来一条消息就跑一次」的快车道长得多。
     """
-    chat = chat_of(title)
-    recent = list(chat["history"])[-settings.context():]
-    lines = []
-    for who, text, name in recent:
-        speaker = "我" if who == "me" else (name or "对方")
-        lines.append(f"{speaker}: {text}")
-    their_recent = [text for who, text, _name in recent if who == "her"]
-    return "\n".join(lines), their_recent
+    return format_transcript(list(chat_of(title)["history"]), settings.advisor_context())
 
 
 def advisor_bg(transcript, their_recent, title):
@@ -160,7 +155,7 @@ def advisor_bg(transcript, their_recent, title):
 
 def start_advisor(title):
     """手动触发慢车道。任何失败都只影响侧栏，绝不碰快车道的候选。"""
-    transcript, their_recent = advisor_context(title)
+    transcript, their_recent = advisor_input(title)
     if not transcript.strip():
         ov.set_advisor_result({"ok": False, "analysis": "", "candidates": [],
                                "elapsed": 0.0, "error": "no-context", "session_id": ""})
