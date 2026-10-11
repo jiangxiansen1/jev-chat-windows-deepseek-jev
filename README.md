@@ -4,6 +4,18 @@
 
 本仓库是基于 [jev-chat/jev-chat-windows](https://github.com/jev-chat/jev-chat-windows) 的公开二次开发版本，不是该项目的官方发行版。我们保留了本地 OCR 和悬浮窗等基础能力，重新实现了模型调用链、自动发送门禁、版本更新和当前界面，并新增 macOS 窗口采集与手动填入适配。详细来源与改动边界见 [NOTICE.md](NOTICE.md)。
 
+> **本机个人二创版（自 2026-10-11 起）**
+>
+> 本副本由本机使用者在上述版本基础上继续改造，用于接入本地的「狗头军师」Skill：
+> 快车道（`core/draft.py`）把起草人格外置为 `prompts/system_general.md`，替换为通用社交版；
+> 并新增一条**手动触发**的「军师」慢车道（`core/advisor.py`），经 `dsh --profile headless`
+> 运行原版狗头军师 skill，产出精简分析 + 3 条话术。
+>
+> 这是**私人用途的本地改动**，与 Aimark-dai、jev-chat 以及狗头军师作者均无关，不代表任何上游项目，
+> 也不对外分发。设计文档与实施计划见仓库内 `docs/superpowers/`。
+> 安全边界保持不变：不自动发送、不注入微信、不解密数据库、不快照留存聊天内容。
+> 原上游 `origin` 与真正的上游 `upstream`（`jev-chat/jev-chat-windows`）均已保留 remote，便于合并更新。
+
 ## 这个版本做了什么
 
 与上游 Windows 项目相比，本仓库的主要变化是：
